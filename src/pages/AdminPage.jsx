@@ -4,7 +4,7 @@ import autoTable from "jspdf-autotable";
 import * as XLSX from "xlsx";
 import { db } from "../firebase";
 import {
-  collection, getDocs, orderBy, query,
+  collection, getDocs, onSnapshot, orderBy, query,
   deleteDoc, doc, addDoc, updateDoc, serverTimestamp, where
 } from "firebase/firestore";
 
@@ -213,18 +213,21 @@ function NuevoScoutPanel({ onSaved }) {
     const errs = validate();
     if (Object.keys(errs).length) return setErrors(errs);
     setLoading(true); setDbError(null);
-    try {
-      await addDoc(collection(db, "registros"), {
-        nombres: form.nombres.trim(), edad: parseInt(form.edad),
-        cumpleanos: form.cumpleanos, direccion: form.direccion.trim(),
-        celular: form.celular.trim(), nombreApoderado: form.nombreApoderado.trim(),
-        relacionApoderado: form.relacionApoderado, celularApoderado: form.celularApoderado.trim(),
-        creadoEn: serverTimestamp(),
-      });
-      setSuccess(true);
-      setTimeout(() => { setSuccess(false); setForm(initialForm); onSaved(); }, 1800);
-    } catch (err) { console.error(err); setDbError("Error al guardar. Verifica tu configuración de Firebase."); }
-    finally { setLoading(false); }
+
+    // Optimistic UI: mostrar éxito inmediatamente sin esperar a Firestore
+    setSuccess(true);
+    setTimeout(() => { setSuccess(false); setForm(initialForm); onSaved(); }, 1500);
+
+    // Guardar en Firestore en segundo plano
+    addDoc(collection(db, "registros"), {
+      nombres: form.nombres.trim(), edad: parseInt(form.edad),
+      cumpleanos: form.cumpleanos, direccion: form.direccion.trim(),
+      celular: form.celular.trim(), nombreApoderado: form.nombreApoderado.trim(),
+      relacionApoderado: form.relacionApoderado, celularApoderado: form.celularApoderado.trim(),
+      creadoEn: serverTimestamp(),
+    }).catch(err => { console.error("Error guardando registro:", err); });
+
+    setLoading(false);
   };
 
   if (success) return (
@@ -365,25 +368,38 @@ function RegistrosPanel({ username, isSuperAdmin }) {
   const [mobileView, setMobile]     = useState("list");
   const [showExport, setShowExport] = useState(false);
 
-  const fetchRegistros = async () => {
+  const fetchRegistros = () => {
     setLoading(true); setError(null);
-    try {
-      const snap = await getDocs(query(collection(db, "registros"), orderBy("creadoEn", "desc")));
-      setRegistros(snap.docs.map(d => ({id: d.id, ...d.data()})));
-    } catch (err) { console.error(err); setError("No se pudieron cargar los registros."); }
-    finally { setLoading(false); }
+    // onSnapshot sirve datos desde caché local instantáneamente,
+    // luego actualiza cuando llegan datos frescos del servidor
+    const q = query(collection(db, "registros"), orderBy("creadoEn", "desc"));
+    const unsub = onSnapshot(q,
+      (snap) => {
+        setRegistros(snap.docs.map(d => ({id: d.id, ...d.data()})));
+        setLoading(false);
+      },
+      (err) => { console.error(err); setError("No se pudieron cargar los registros."); setLoading(false); }
+    );
+    return unsub;
   };
 
-  useEffect(() => { fetchRegistros(); }, []);
+  useEffect(() => {
+    const unsub = fetchRegistros();
+    return () => unsub && unsub(); // cleanup al desmontar
+  }, []);
 
   const handleDelete = async (id) => {
     setDeleting(id);
-    try {
-      await deleteDoc(doc(db, "registros", id));
-      setRegistros(p => p.filter(r => r.id !== id));
-      if (selected?.id === id) { setSelected(null); setMobile("list"); }
-    } catch (err) { console.error(err); }
-    finally { setDeleting(null); setConfirm(null); }
+    // Optimistic delete: quitar de UI al instante
+    const prev = registros;
+    setRegistros(p => p.filter(r => r.id !== id));
+    if (selected?.id === id) { setSelected(null); setMobile("list"); }
+    setDeleting(null); setConfirm(null);
+    // Borrar en Firestore en segundo plano
+    deleteDoc(doc(db, "registros", id)).catch(err => {
+      console.error(err);
+      setRegistros(prev); // revertir si falla
+    });
   };
 
   const filtered = registros.filter(r =>
