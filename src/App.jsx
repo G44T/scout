@@ -6,7 +6,7 @@ import AdminPage from "./pages/AdminPage";
 export default function App() {
   return (
     <Routes>
-      <Route path="/index" element={<FormPage />} />
+      <Route path="/" element={<FormPage />} />
       <Route path="/admin" element={<AdminPage />} />
     </Routes>
   );
