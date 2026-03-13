@@ -2,11 +2,16 @@ import { useState, useEffect, useRef } from "react";
 import jsPDF from "jspdf";
 import autoTable from "jspdf-autotable";
 import * as XLSX from "xlsx";
-import { db } from "../firebase";
+import { db, auth } from "../firebase";
 import {
   collection, getDocs, onSnapshot, orderBy, query,
   deleteDoc, doc, addDoc, updateDoc, serverTimestamp, where
 } from "firebase/firestore";
+import {
+  signInWithEmailAndPassword, signOut,
+  createUserWithEmailAndPassword, sendPasswordResetEmail,
+  deleteUser, fetchSignInMethodsForEmail
+} from "firebase/auth";
 
 const ADMIN_USER   = import.meta.env.VITE_ADMIN_USER   || "admin";
 const ADMIN_PASS   = import.meta.env.VITE_ADMIN_PASS   || "scout2024";
@@ -68,29 +73,29 @@ export default function AdminPage() {
             <button className={`admin-nav-item ${section === "registros" ? "active" : ""}`}
               onClick={() => setSection("registros")} title="Registros">
               <span className="nav-icon">📋</span>
-              {!collapsed && <span>Registros</span>}
+              <span className={`nav-label ${collapsed ? "nav-label-hidden" : ""}`}>Registros</span>
             </button>
             <button className={`admin-nav-item ${section === "nuevo" ? "active" : ""}`}
               onClick={() => setSection("nuevo")} title="Nuevo Scout">
               <span className="nav-icon">➕</span>
-              {!collapsed && <span>Nuevo scout</span>}
+              <span className={`nav-label ${collapsed ? "nav-label-hidden" : ""}`}>Nuevo scout</span>
             </button>
             {isSuperAdmin && (
               <button className={`admin-nav-item ${section === "usuarios" ? "active" : ""}`}
                 onClick={() => setSection("usuarios")} title="Usuarios admin">
                 <span className="nav-icon">👥</span>
-                {!collapsed && <span>Usuarios admin</span>}
+                <span className={`nav-label ${collapsed ? "nav-label-hidden" : ""}`}>Usuarios</span>
               </button>
             )}
             {isSuperAdmin && (
               <button className={`admin-nav-item ${section === "logs" ? "active" : ""}`}
                 onClick={() => setSection("logs")} title="Historial de descargas">
                 <span className="nav-icon">🕵️</span>
-                {!collapsed && <span>Historial descargas</span>}
+                <span className={`nav-label ${collapsed ? "nav-label-hidden" : ""}`}>Historial</span>
               </button>
             )}
             {collapsed && (
-              <button className="admin-nav-item" onClick={handleLogout} title="Cerrar sesión">
+              <button className="admin-nav-item sidebar-logout-collapsed" onClick={handleLogout} title="Cerrar sesión">
                 <span className="nav-icon">⏻</span>
               </button>
             )}
@@ -123,9 +128,33 @@ function LoginScreen({ onLogin }) {
     e.preventDefault();
     if (!user.trim() || !pass) return shake("Completa todos los campos");
     setLoading(true);
+
+    // 1. Check .env super admin (legacy)
     if (user.trim() === ADMIN_USER && pass === ADMIN_PASS) {
       onLogin(true, ADMIN_NOMBRE); return;
     }
+
+    // 2. Try Firebase Auth (email-based admins)
+    const isEmail = user.includes("@");
+    if (isEmail) {
+      try {
+        const cred = await signInWithEmailAndPassword(auth, user.trim(), pass);
+        const snap = await getDocs(query(collection(db, "admins"), where("uid", "==", cred.user.uid)));
+        if (!snap.empty) {
+          const data = snap.docs[0].data();
+          onLogin(data.superAdmin === true, data.nombre);
+        } else {
+          await signOut(auth);
+          shake("No tienes permisos de administrador");
+        }
+      } catch (err) {
+        console.error(err);
+        shake("Correo o contraseña incorrectos");
+      } finally { setLoading(false); }
+      return;
+    }
+
+    // 3. Legacy username+password (Firestore hash) for backward compat
     try {
       const hashed = await hashPassword(pass);
       const snap = await getDocs(query(collection(db, "admins"), where("usuario", "==", user.trim().toLowerCase())));
@@ -145,7 +174,7 @@ function LoginScreen({ onLogin }) {
         <div className="login-top">
           <img src="/favicon.png" alt="Scout" className="login-logo" />
           <h1 className="login-title">Panel de Administración</h1>
-          <p className="login-sub">Ingresa tus credenciales para continuar</p>
+          <p className="login-sub">Usa tu usuario o correo electrónico</p>
         </div>
         <form onSubmit={handleSubmit} noValidate className="login-form">
           <div className="field-wrap">
@@ -646,10 +675,18 @@ function UsuariosPanel() {
             <div className="usuario-card" key={a.id}>
               <div className="usuario-avatar">{a.nombre?.[0]?.toUpperCase() || "A"}</div>
               <div className="usuario-info">
-                <span className="usuario-nombre">{a.nombre}</span>
+                <div className="usuario-nombre-row">
+                  <span className="usuario-nombre">{a.nombre}</span>
+                  {a.superAdmin && (
+                    <span className="badge-super-icon" title="Super Admin">
+                      <svg width="14" height="14" viewBox="0 0 24 24" fill="none" xmlns="http://www.w3.org/2000/svg">
+                        <path d="M12 2L15.09 8.26L22 9.27L17 14.14L18.18 21.02L12 17.77L5.82 21.02L7 14.14L2 9.27L8.91 8.26L12 2Z" fill="#c4622d" stroke="#c4622d" strokeWidth="1.5" strokeLinecap="round" strokeLinejoin="round"/>
+                      </svg>
+                    </span>
+                  )}
+                </div>
                 <span className="usuario-usuario">@{a.usuario}</span>
               </div>
-              {a.superAdmin && <span className="badge-super">Super Admin</span>}
               <span className="usuario-fecha">{fmtDate(a.creadoEn)}</span>
               <button className="edit-btn" onClick={() => setEditTarget(a)} title="Editar">✏️</button>
               <button className="delete-btn" onClick={() => setConfirm(a)} title="Eliminar">🗑️</button>
@@ -699,15 +736,14 @@ function UsuariosPanel() {
 function AdminFormModal({ mode, admin, onClose, onDone }) {
   const isEdit = mode === "edit";
   const [form, setForm] = useState({
-    nombre:     isEdit ? admin.nombre    : "",
-    usuario:    isEdit ? admin.usuario   : "",
-    pass:       "",
-    confirm:    "",
+    nombre:     isEdit ? admin.nombre  : "",
+    usuario:    isEdit ? admin.usuario : "",
+    correo:     isEdit ? (admin.correo || "") : "",
     superAdmin: isEdit ? (admin.superAdmin === true) : false,
   });
-  const [showPass, setShowP]  = useState(false);
   const [errors, setErrors]   = useState({});
   const [loading, setLoading] = useState(false);
+  const [sent, setSent]       = useState(false);
 
   const set = (k, v) => { setForm(p => ({...p, [k]: v})); if (errors[k]) setErrors(p => ({...p, [k]: ""})); };
 
@@ -715,13 +751,8 @@ function AdminFormModal({ mode, admin, onClose, onDone }) {
     const e = {};
     if (!form.nombre.trim()) e.nombre = "Campo obligatorio";
     if (!form.usuario.trim() || form.usuario.trim().length < 3) e.usuario = "Mínimo 3 caracteres";
-    if (!isEdit) {
-      if (form.pass.length < 6) e.pass = "Mínimo 6 caracteres";
-      if (form.pass !== form.confirm) e.confirm = "Las contraseñas no coinciden";
-    } else if (form.pass) {
-      if (form.pass.length < 6) e.pass = "Mínimo 6 caracteres";
-      if (form.pass !== form.confirm) e.confirm = "Las contraseñas no coinciden";
-    }
+    if (!isEdit && !form.correo.trim()) e.correo = "Campo obligatorio";
+    if (form.correo && !/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(form.correo)) e.correo = "Correo inválido";
     return e;
   };
 
@@ -734,28 +765,66 @@ function AdminFormModal({ mode, admin, onClose, onDone }) {
       const usuarioNorm = form.usuario.trim().toLowerCase();
 
       if (isEdit) {
+        // Edit: update Firestore fields only
         const updates = {
           nombre:     form.nombre.trim(),
           usuario:    usuarioNorm,
           superAdmin: form.superAdmin,
         };
-        if (form.pass) updates.password = await hashPassword(form.pass);
+        if (form.correo.trim()) updates.correo = form.correo.trim().toLowerCase();
         await updateDoc(doc(db, "admins", admin.id), updates);
+
+        // If email changed, send reset email to new address
+        if (form.correo && form.correo.trim().toLowerCase() !== (admin.correo || "")) {
+          await sendPasswordResetEmail(auth, form.correo.trim().toLowerCase());
+        }
+        onDone();
       } else {
+        // Create: check duplicate username
         const existing = await getDocs(query(collection(db, "admins"), where("usuario", "==", usuarioNorm)));
         if (!existing.empty) { setErrors({usuario: "Ese usuario ya existe"}); setLoading(false); return; }
-        const hashed = await hashPassword(form.pass);
+
+        const correoNorm = form.correo.trim().toLowerCase();
+
+        // Create Firebase Auth user with temp password
+        const tempPass = Math.random().toString(36).slice(-10) + "Aa1!";
+        const cred = await createUserWithEmailAndPassword(auth, correoNorm, tempPass);
+
+        // Save to Firestore with uid
         await addDoc(collection(db, "admins"), {
-          nombre: form.nombre.trim(), usuario: usuarioNorm,
-          password: hashed, superAdmin: form.superAdmin, creadoEn: serverTimestamp(),
+          nombre:     form.nombre.trim(),
+          usuario:    usuarioNorm,
+          correo:     correoNorm,
+          uid:        cred.user.uid,
+          superAdmin: form.superAdmin,
+          creadoEn:   serverTimestamp(),
         });
+
+        // Send password reset so they can set their own password
+        await sendPasswordResetEmail(auth, correoNorm);
+        setSent(true);
+        setTimeout(() => { setSent(false); onDone(); }, 2500);
       }
-      onDone();
     } catch (err) {
       console.error(err);
-      setErrors({general: "Error al guardar. Intenta de nuevo."});
+      const msg = err.code === "auth/email-already-in-use"
+        ? "Ese correo ya está en uso"
+        : err.code === "auth/invalid-email"
+        ? "Correo inválido"
+        : "Error al crear el usuario. Intenta de nuevo.";
+      setErrors({general: msg});
     } finally { setLoading(false); }
   };
+
+  if (sent) return (
+    <div className="modal-overlay">
+      <div className="modal" style={{textAlign:"center"}}>
+        <div className="modal-icon">📧</div>
+        <h3 className="modal-title">¡Invitación enviada!</h3>
+        <p className="modal-sub">Se envió un correo a <strong>{form.correo}</strong> para que el nuevo admin establezca su contraseña.</p>
+      </div>
+    </div>
+  );
 
   return (
     <div className="modal-overlay" onClick={onClose}>
@@ -764,7 +833,9 @@ function AdminFormModal({ mode, admin, onClose, onDone }) {
           {isEdit ? "Editar administrador" : "Nuevo administrador"}
         </h3>
         <p className="modal-sub" style={{textAlign:"left", marginBottom:"1.2rem"}}>
-          {isEdit ? "Modifica los datos del administrador. Deja la contraseña en blanco para no cambiarla." : "El nuevo usuario podrá acceder al panel admin."}
+          {isEdit
+            ? "Modifica los datos del administrador."
+            : "Se enviará un correo de invitación para que el nuevo admin establezca su contraseña."}
         </p>
 
         <form onSubmit={handleSubmit} noValidate>
@@ -778,23 +849,15 @@ function AdminFormModal({ mode, admin, onClose, onDone }) {
               placeholder="Ej: anascout" autoComplete="off" value={form.usuario}
               onChange={e => set("usuario", e.target.value)} />
           </F>
-          <F label={isEdit ? "Nueva contraseña (opcional)" : "Contraseña"} err={errors.pass}>
-            <div className="pass-wrap">
-              <input className={`inp ${errors.pass ? "inp-err" : ""}`}
-                type={showPass ? "text" : "password"}
-                placeholder={isEdit ? "Dejar en blanco para no cambiar" : "Mínimo 6 caracteres"}
-                value={form.pass} onChange={e => set("pass", e.target.value)} />
-              <button type="button" className="pass-toggle" onClick={() => setShowP(v => !v)}>
-                {showPass ? "🙈" : "👁️"}
-              </button>
-            </div>
+          <F label={isEdit ? "Correo electrónico (opcional)" : "Correo electrónico"} err={errors.correo}>
+            <input className={`inp ${errors.correo ? "inp-err" : ""}`} type="email"
+              placeholder="Ej: ana@scouts.org" autoComplete="off" value={form.correo}
+              onChange={e => set("correo", e.target.value)} />
           </F>
-          {(!isEdit || form.pass) && (
-            <F label="Confirmar contraseña" err={errors.confirm}>
-              <input className={`inp ${errors.confirm ? "inp-err" : ""}`}
-                type={showPass ? "text" : "password"} placeholder="Repite la contraseña"
-                value={form.confirm} onChange={e => set("confirm", e.target.value)} />
-            </F>
+          {isEdit && form.correo && form.correo !== admin.correo && (
+            <p style={{fontSize:"0.75rem", color:"var(--forest)", marginTop:"-0.5rem", marginBottom:"0.75rem"}}>
+              📧 Se enviará un correo de restablecimiento al nuevo correo
+            </p>
           )}
 
           <div className="super-toggle-wrap">
@@ -816,7 +879,9 @@ function AdminFormModal({ mode, admin, onClose, onDone }) {
             <button type="button" className="modal-cancel" onClick={onClose}>Cancelar</button>
             <button type="submit" className="modal-confirm" style={{background:"var(--forest)"}} disabled={loading}>
               {loading && <span className="spinner"/>}
-              {loading ? "Guardando..." : isEdit ? "Guardar cambios" : "Crear admin"}
+              {loading
+                ? (isEdit ? "Guardando..." : "Creando y enviando...")
+                : (isEdit ? "Guardar cambios" : "Crear y enviar invitación")}
             </button>
           </div>
         </form>
